@@ -125,10 +125,18 @@ float batteryVoltage = NAN;
 int batteryPercent = -1;
 unsigned long lastBatteryReadMs = 0;
 unsigned long lastDogFrameMs = 0;
+unsigned long lastDisplayDrawMs = 0;
+unsigned long lastDisplayMaintenanceMs = 0;
 int dogFrame = 0;
 int dogX = 160;
 int dogDirection = 1;
 String currentFooter = "Starting BLE...";
+String requestedFooter = "";
+volatile bool redrawRequested = false;
+
+static const unsigned long DOG_FRAME_INTERVAL_MS = 8000;
+static const unsigned long DISPLAY_MAINTENANCE_MS = 300000;
+static const unsigned long DISPLAY_HEARTBEAT_MS = 60000;
 
 uint8_t crc8(const uint8_t *data, int len) {
   uint8_t crc = 0xFF;
@@ -245,6 +253,17 @@ void drawText(int x, int y, const char *text, const uint8_t *font, uint16_t fg =
   u8g2.setForegroundColor(fg);
   u8g2.setBackgroundColor(bg);
   u8g2.drawUTF8(x, y, text);
+}
+
+void wakeDisplay() {
+  display.High_Power_Mode();
+  display.display_on(true);
+  display.display_Inversion(false);
+}
+
+void requestRedraw(const char *footer) {
+  requestedFooter = footer;
+  redrawRequested = true;
 }
 
 void drawBatteryStatus(int x, int y, bool inverted = false) {
@@ -547,7 +566,9 @@ void drawScreen(const char *footer) {
 
   drawText(16, 286, footer, u8g2_font_6x12_tf);
   drawBatteryStatus(306, 286);
+  wakeDisplay();
   display.display();
+  lastDisplayDrawMs = millis();
 }
 
 void drawTrend(int x, int y, int w, int h, const StockInfo &stock) {
@@ -619,7 +640,9 @@ void drawStocksScreen(const char *footer) {
 
   drawText(14, 294, footer, u8g2_font_6x12_tf);
   drawBatteryStatus(306, 294);
+  wakeDisplay();
   display.display();
+  lastDisplayDrawMs = millis();
 }
 
 void drawCurrentPage(const char *footer) {
@@ -658,7 +681,7 @@ void handleJsonLine(const String &line) {
   if (err) {
     usage.ok = false;
     usage.error = String("JSON: ") + err.c_str();
-    drawCurrentPage("Bad JSON from PC.");
+    requestRedraw("Bad JSON from PC.");
     sendAck("ERR json");
     return;
   }
@@ -697,7 +720,7 @@ void handleJsonLine(const String &line) {
     idx++;
   }
 
-  drawCurrentPage("Updated from PC via BLE.");
+  requestRedraw("Updated from PC via BLE.");
   sendAck("OK updated");
 }
 
@@ -705,14 +728,14 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     bleConnected = true;
     Serial.println("BLE client connected.");
-    drawCurrentPage("BLE connected.");
+    requestRedraw("BLE connected.");
   }
 
   void onDisconnect(BLEServer *server) override {
     bleConnected = false;
     Serial.println("BLE client disconnected. Advertising again.");
     server->getAdvertising()->start();
-    drawCurrentPage("BLE disconnected.");
+    requestRedraw("BLE disconnected.");
   }
 };
 
@@ -815,11 +838,16 @@ void loop() {
   if (keyDown && !lastKeyDown && millis() - lastKeyMs > 250) {
     lastKeyMs = millis();
     currentPage = currentPage == 0 ? 1 : 0;
-    drawCurrentPage(currentPage == 0 ? "Page: Codex" : "Page: Stocks");
+    requestRedraw(currentPage == 0 ? "Page: Codex" : "Page: Stocks");
   }
   lastKeyDown = keyDown;
 
-  if (currentPage == 0 && hasPcData && millis() - lastDogFrameMs > 1200) {
+  if (redrawRequested) {
+    redrawRequested = false;
+    drawCurrentPage(requestedFooter.length() ? requestedFooter.c_str() : currentFooter.c_str());
+  }
+
+  if (currentPage == 0 && hasPcData && millis() - lastDogFrameMs > DOG_FRAME_INTERVAL_MS) {
     lastDogFrameMs = millis();
     dogFrame++;
 
@@ -851,7 +879,15 @@ void loop() {
       dogX = 126;
       dogDirection = 1;
     }
-    drawCurrentPage(currentFooter.c_str());
+    requestRedraw(currentFooter.c_str());
+  }
+
+  if (millis() - lastDisplayMaintenanceMs > DISPLAY_MAINTENANCE_MS) {
+    lastDisplayMaintenanceMs = millis();
+    wakeDisplay();
+    requestRedraw(currentFooter.c_str());
+  } else if (millis() - lastDisplayDrawMs > DISPLAY_HEARTBEAT_MS) {
+    requestRedraw(currentFooter.c_str());
   }
   delay(100);
 }
