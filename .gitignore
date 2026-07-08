@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tmp
+.env
+.venv/
+venv/
+build/
+dist/
+*.zip
+*.bin
+*.elf
+*.map
+.DS_Store
+Thumbs.db

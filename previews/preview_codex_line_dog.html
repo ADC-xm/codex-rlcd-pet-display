@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex RLCD Line Dog Preview</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: #dfe6e1;
+    font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+    color: #111;
+  }
+  .wrap {
+    display: grid;
+    gap: 14px;
+    justify-items: center;
+  }
+  .screen {
+    width: min(800px, 94vw);
+    aspect-ratio: 4 / 3;
+    border: 8px solid #111;
+    background: #eef3ef;
+    box-shadow: 0 12px 30px rgba(0,0,0,.2);
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+  }
+  .caption {
+    width: min(800px, 94vw);
+    font-size: 14px;
+    line-height: 1.55;
+    color: #4b534d;
+  }
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="screen">
+      <canvas id="screen" width="400" height="300"></canvas>
+    </section>
+    <div class="caption">原创线条小狗预览：在 Codex 额度页面顶部活动，保留下方额度、温湿度、电量等信息区域。</div>
+  </main>
+
+<script>
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const W = 400;
+const H = 300;
+
+function clear() {
+  ctx.fillStyle = "#eef3ef";
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "#111";
+  ctx.fillStyle = "#111";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+}
+
+function text(s, x, y, size = 12, bold = false, white = false) {
+  ctx.fillStyle = white ? "#eef3ef" : "#111";
+  ctx.font = `${bold ? "700 " : ""}${size}px Segoe UI, Arial`;
+  ctx.fillText(s, x, y);
+}
+
+function rect(x, y, w, h, fill = false) {
+  if (fill) ctx.fillRect(x, y, w, h);
+  else ctx.strokeRect(x, y, w, h);
+}
+
+function bar(x, y, w, h, pct) {
+  rect(x, y, w, h);
+  ctx.fillRect(x + 2, y + 2, Math.max(0, (w - 4) * pct / 100), h - 4);
+}
+
+function drawCodexPage(t) {
+  clear();
+  ctx.fillStyle = "#111";
+  rect(0, 0, W, H);
+  ctx.fillRect(0, 0, W, 46);
+  text("CODEX BLE", 16, 32, 24, true, true);
+  text("BLE: connected  Codex: running", 190, 22, 12, false, true);
+  text("07-08 10:38:32  Plan: pro", 190, 39, 10, false, true);
+
+  text("Room 25.1C  54%RH", 24, 73, 16, true);
+  text("BAT 82%", 306, 286, 12);
+  rect(364, 275, 24, 10);
+  ctx.fillRect(389, 278, 3, 4);
+  ctx.fillRect(366, 277, 16, 6);
+
+  text("5h remaining", 24, 120, 16, true);
+  text("96%", 24, 158, 38, true);
+  bar(24, 172, 160, 22, 96);
+  text("used 4%  reset 14:30", 24, 216, 11);
+
+  ctx.beginPath();
+  ctx.moveTo(200, 88);
+  ctx.lineTo(200, 258);
+  ctx.stroke();
+
+  text("7d remaining", 224, 120, 16, true);
+  text("74%", 224, 158, 38, true);
+  bar(224, 172, 150, 22, 74);
+  text("used 26%  reset 07-14", 224, 216, 11);
+  text("Updated from PC via BLE.", 16, 286, 11);
+
+  drawLineDog(t);
+}
+
+function drawLineDog(t) {
+  const laneLeft = 36;
+  const laneRight = 326;
+  const period = 9000;
+  const phase = (t % period) / period;
+  const forward = phase < 0.5;
+  const p = forward ? phase * 2 : 1 - (phase - 0.5) * 2;
+  const x = laneLeft + p * (laneRight - laneLeft);
+  const y = 88 + Math.sin(t / 280) * 2;
+  const dir = forward ? 1 : -1;
+  const step = Math.floor(t / 180) % 4;
+  const blink = Math.floor(t / 1300) % 7 === 0;
+  const tail = Math.sin(t / 130) * 8;
+  const wag = Math.sin(t / 160) * 7;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(dir, 1);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#111";
+  ctx.fillStyle = "#eef3ef";
+
+  // body and fluffy head, intentionally original line-art puppy.
+  ctx.beginPath();
+  ctx.moveTo(-30, 16);
+  ctx.quadraticCurveTo(-34, -14, -7, -24);
+  ctx.quadraticCurveTo(24, -38, 44, -15);
+  ctx.quadraticCurveTo(57, 2, 44, 20);
+  ctx.quadraticCurveTo(25, 40, -6, 32);
+  ctx.quadraticCurveTo(-28, 30, -30, 16);
+  ctx.stroke();
+
+  // ears.
+  ctx.beginPath();
+  ctx.moveTo(-12, -22);
+  ctx.quadraticCurveTo(-24, -37, -35, -20);
+  ctx.quadraticCurveTo(-35, -4, -20, -5);
+  ctx.moveTo(28, -21);
+  ctx.quadraticCurveTo(45, -32, 48, -8);
+  ctx.quadraticCurveTo(45, 6, 33, 3);
+  ctx.stroke();
+
+  // face.
+  ctx.beginPath();
+  if (blink) {
+    ctx.moveTo(-2, 0); ctx.lineTo(7, 0);
+    ctx.moveTo(25, 0); ctx.lineTo(34, 0);
+  } else {
+    ctx.arc(3, -1, 2.5, 0, Math.PI * 2);
+    ctx.arc(29, -1, 2.5, 0, Math.PI * 2);
+  }
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(16, 8);
+  ctx.quadraticCurveTo(12, 14, 7, 10);
+  ctx.moveTo(16, 8);
+  ctx.quadraticCurveTo(21, 14, 27, 10);
+  ctx.stroke();
+
+  // tongue every few seconds.
+  if (Math.floor(t / 2200) % 3 === 1) {
+    ctx.beginPath();
+    ctx.moveTo(16, 14);
+    ctx.quadraticCurveTo(19, 22, 23, 14);
+    ctx.stroke();
+  }
+
+  // paws.
+  const liftA = step === 0 || step === 2 ? -5 : 2;
+  const liftB = step === 1 || step === 3 ? -5 : 2;
+  ctx.beginPath();
+  ctx.moveTo(-12, 29);
+  ctx.quadraticCurveTo(-17, 42 + liftA, -5, 39 + liftA);
+  ctx.moveTo(24, 30);
+  ctx.quadraticCurveTo(19, 42 + liftB, 31, 39 + liftB);
+  ctx.stroke();
+
+  // tail.
+  ctx.beginPath();
+  ctx.moveTo(-31, 6);
+  ctx.quadraticCurveTo(-55, -8 + tail, -38, -26 + wag);
+  ctx.stroke();
+
+  // small motion marks.
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-72, 28);
+  ctx.lineTo(-58, 28);
+  ctx.moveTo(-66, 38);
+  ctx.lineTo(-52, 38);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function loop(ts) {
+  drawCodexPage(ts);
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
