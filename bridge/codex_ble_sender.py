@@ -25,6 +25,8 @@ LOG_PATH = ROOT / "codex_ble_sender.log"
 BLE_CHUNK_SIZE = 160
 HTTP = requests.Session()
 HTTP.trust_env = False
+LAST_GOOD_QUOTA = None
+PENDING_QUOTA = None
 
 STOCKS = [
     {"name": "上证指数", "code": "000001", "secid": "1.000001"},
@@ -169,7 +171,7 @@ def normalize_window(data, fallback_label):
     if not isinstance(data, dict):
         return {"label": fallback_label, "used": -1, "remaining": -1, "reset": "-"}
 
-    used = clamp_percent(data.get("usedPercent", 0))
+    used = clamp_percent(data.get("usedPercent"))
     if used is None:
         used = -1
 
@@ -197,22 +199,116 @@ def normalize_window(data, fallback_label):
     }
 
 
+def snapshot_has_quota(item):
+    return (
+        isinstance(item, dict)
+        and isinstance(item.get("primary"), dict)
+        and isinstance(item.get("secondary"), dict)
+    )
+
+
 def pick_snapshot(response):
     if not isinstance(response, dict):
         raise RuntimeError("Unexpected Codex response.")
 
     by_id = response.get("rateLimitsByLimitId")
     if isinstance(by_id, dict):
-        if isinstance(by_id.get("codex"), dict):
+        if snapshot_has_quota(by_id.get("codex")):
             return by_id["codex"]
-        for item in by_id.values():
-            if isinstance(item, dict):
+        for limit_id, item in by_id.items():
+            if snapshot_has_quota(item):
+                log(f"Using Codex rate-limit snapshot id: {limit_id}")
                 return item
 
-    if isinstance(response.get("rateLimits"), dict):
+    if snapshot_has_quota(response.get("rateLimits")):
         return response["rateLimits"]
 
     raise RuntimeError("No Codex rate-limit snapshot was returned.")
+
+
+def has_valid_quota(primary, secondary):
+    return (
+        isinstance(primary, dict)
+        and isinstance(secondary, dict)
+        and 0 <= primary.get("used", -1) <= 100
+        and 0 <= primary.get("remaining", -1) <= 100
+        and 0 <= secondary.get("used", -1) <= 100
+        and 0 <= secondary.get("remaining", -1) <= 100
+    )
+
+
+def quota_key(primary, secondary):
+    return (
+        primary.get("used"),
+        primary.get("remaining"),
+        primary.get("reset"),
+        secondary.get("used"),
+        secondary.get("remaining"),
+        secondary.get("reset"),
+    )
+
+
+def looks_like_bad_full_spike(current, previous):
+    if not previous:
+        return False
+
+    primary = current["primary"]
+    secondary = current["secondary"]
+    old_primary = previous["primary"]
+    old_secondary = previous["secondary"]
+
+    primary_jump = primary["remaining"] - old_primary["remaining"]
+    secondary_jump = secondary["remaining"] - old_secondary["remaining"]
+
+    # Real 5h resets can jump upward by themselves. The bad Codex app-server
+    # sample we see in logs makes both windows look almost full for one cycle.
+    return (
+        primary["remaining"] >= 95
+        and secondary["remaining"] >= 95
+        and primary_jump >= 5
+        and secondary_jump >= 25
+    )
+
+
+def stabilize_quota(primary, secondary, plan_type):
+    global LAST_GOOD_QUOTA, PENDING_QUOTA
+
+    if not has_valid_quota(primary, secondary):
+        if LAST_GOOD_QUOTA:
+            cached = dict(LAST_GOOD_QUOTA)
+            cached["cached"] = True
+            cached["error"] = "invalid quota sample; using previous"
+            return cached
+        raise RuntimeError("Codex quota sample was incomplete.")
+
+    current = {
+        "primary": primary,
+        "secondary": secondary,
+        "plan_type": plan_type,
+        "cached": False,
+        "error": "",
+    }
+
+    if looks_like_bad_full_spike(current, LAST_GOOD_QUOTA):
+        if PENDING_QUOTA and quota_key(primary, secondary) == quota_key(PENDING_QUOTA["primary"], PENDING_QUOTA["secondary"]):
+            LAST_GOOD_QUOTA = current
+            PENDING_QUOTA = None
+            log("Accepted repeated high quota sample after confirmation.")
+            return current
+
+        PENDING_QUOTA = current
+        cached = dict(LAST_GOOD_QUOTA)
+        cached["cached"] = True
+        cached["error"] = (
+            f"ignored one-cycle quota spike "
+            f"5h {primary['remaining']}%, 7d {secondary['remaining']}%"
+        )
+        log(cached["error"])
+        return cached
+
+    LAST_GOOD_QUOTA = current
+    PENDING_QUOTA = None
+    return current
 
 
 def is_codex_running():
@@ -248,9 +344,13 @@ def build_payload():
         primary = normalize_window(snapshot.get("primary"), "5h")
         secondary = normalize_window(snapshot.get("secondary"), "7d")
         plan_type = snapshot.get("planType") or "unknown"
+        stable = stabilize_quota(primary, secondary, plan_type)
+        primary = stable["primary"]
+        secondary = stable["secondary"]
+        plan_type = stable["plan_type"]
         ok = True
-        status = "running" if running else "not running"
-        error = ""
+        status = "cached" if stable["cached"] else ("running" if running else "not running")
+        error = stable["error"]
     except Exception as exc:
         primary = {"label": "5h", "used": -1, "remaining": -1, "reset": "-"}
         secondary = {"label": "7d", "used": -1, "remaining": -1, "reset": "-"}
