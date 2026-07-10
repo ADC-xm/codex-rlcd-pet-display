@@ -21,6 +21,8 @@ REFRESH_SECONDS = 10
 CODEX_REFRESH_SECONDS = 30
 CODEX_ERROR_BACKOFF_SECONDS = 120
 REQUEST_TIMEOUT_SECONDS = 15
+PRIMARY_WINDOW_MINS = 5 * 60
+SECONDARY_WINDOW_MINS = 7 * 24 * 60
 APP_NAME = "Codex BLE Sender"
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "codex_ble_sender.log"
@@ -175,7 +177,7 @@ def clamp_percent(value):
 
 def normalize_window(data, fallback_label):
     if not isinstance(data, dict):
-        return {"label": fallback_label, "used": -1, "remaining": -1, "reset": "-"}
+        return {"label": fallback_label, "used": -1, "remaining": -1, "reset": "-", "reset_ts": None, "duration": None}
 
     used = clamp_percent(data.get("usedPercent"))
     if used is None:
@@ -190,10 +192,12 @@ def normalize_window(data, fallback_label):
             label = f"{round(duration / 60)}h"
 
     reset_text = "-"
+    reset_ts = None
     resets_at = data.get("resetsAt")
     if resets_at:
         try:
-            reset_text = datetime.fromtimestamp(float(resets_at)).strftime("%m-%d %H:%M")
+            reset_ts = float(resets_at)
+            reset_text = datetime.fromtimestamp(reset_ts).strftime("%m-%d %H:%M")
         except (TypeError, ValueError, OSError):
             reset_text = str(resets_at)
 
@@ -202,6 +206,8 @@ def normalize_window(data, fallback_label):
         "used": used,
         "remaining": max(0, 100 - used) if used >= 0 else -1,
         "reset": reset_text,
+        "reset_ts": reset_ts,
+        "duration": duration,
     }
 
 
@@ -243,6 +249,22 @@ def has_valid_quota(primary, secondary):
     )
 
 
+def duration_matches(value, expected):
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return True
+    tolerance = 10 if expected == PRIMARY_WINDOW_MINS else 90
+    return abs(duration - expected) <= tolerance
+
+
+def has_expected_windows(primary, secondary):
+    return (
+        duration_matches(primary.get("duration"), PRIMARY_WINDOW_MINS)
+        and duration_matches(secondary.get("duration"), SECONDARY_WINDOW_MINS)
+    )
+
+
 def quota_key(primary, secondary):
     return (
         primary.get("used"),
@@ -252,6 +274,40 @@ def quota_key(primary, secondary):
         secondary.get("remaining"),
         secondary.get("reset"),
     )
+
+
+def reset_advanced(old_window, new_window, expected_duration_mins):
+    old_ts = old_window.get("reset_ts")
+    new_ts = new_window.get("reset_ts")
+    try:
+        old_ts = float(old_ts)
+        new_ts = float(new_ts)
+    except (TypeError, ValueError):
+        return False
+
+    min_advance_seconds = expected_duration_mins * 60 * 0.5
+    return new_ts - old_ts >= min_advance_seconds
+
+
+def jump_has_reset_evidence(current, previous):
+    if not previous:
+        return False
+
+    saw_jump = False
+    checks = (
+        ("primary", PRIMARY_WINDOW_MINS),
+        ("secondary", SECONDARY_WINDOW_MINS),
+    )
+    for key, duration in checks:
+        old_window = previous[key]
+        new_window = current[key]
+        jump = new_window["remaining"] - old_window["remaining"]
+        if jump < 25:
+            continue
+        saw_jump = True
+        if not reset_advanced(old_window, new_window, duration):
+            return False
+    return saw_jump
 
 
 def looks_like_bad_full_spike(current, previous):
@@ -273,13 +329,8 @@ def looks_like_bad_full_spike(current, previous):
         and secondary["remaining"] >= 95
         and primary_jump >= 5
         and secondary_jump >= 25
+        and not jump_has_reset_evidence(current, previous)
     )
-
-
-def looks_like_initial_full_sample(current):
-    primary = current["primary"]
-    secondary = current["secondary"]
-    return primary["remaining"] >= 95 and secondary["remaining"] >= 95
 
 
 def stabilize_quota(primary, secondary, plan_type):
@@ -293,6 +344,21 @@ def stabilize_quota(primary, secondary, plan_type):
             return cached
         raise RuntimeError("Codex quota sample was incomplete.")
 
+    if not has_expected_windows(primary, secondary):
+        if LAST_GOOD_QUOTA:
+            cached = dict(LAST_GOOD_QUOTA)
+            cached["cached"] = True
+            cached["error"] = (
+                f"unexpected quota windows "
+                f"5h={primary.get('duration')}, 7d={secondary.get('duration')}"
+            )
+            log(cached["error"])
+            return cached
+        raise RuntimeError(
+            f"Codex quota windows did not match expected durations: "
+            f"5h={primary.get('duration')}, 7d={secondary.get('duration')}"
+        )
+
     current = {
         "primary": primary,
         "secondary": secondary,
@@ -301,17 +367,7 @@ def stabilize_quota(primary, secondary, plan_type):
         "error": "",
     }
 
-    if not LAST_GOOD_QUOTA and looks_like_initial_full_sample(current):
-        PENDING_QUOTA = current
-        raise RuntimeError("initial Codex quota sample looked suspiciously full; waiting")
-
     if looks_like_bad_full_spike(current, LAST_GOOD_QUOTA):
-        if PENDING_QUOTA and quota_key(primary, secondary) == quota_key(PENDING_QUOTA["primary"], PENDING_QUOTA["secondary"]):
-            LAST_GOOD_QUOTA = current
-            PENDING_QUOTA = None
-            log("Accepted repeated high quota sample after confirmation.")
-            return current
-
         PENDING_QUOTA = current
         cached = dict(LAST_GOOD_QUOTA)
         cached["cached"] = True
@@ -321,6 +377,13 @@ def stabilize_quota(primary, secondary, plan_type):
         )
         log(cached["error"])
         return cached
+
+    if LAST_GOOD_QUOTA and jump_has_reset_evidence(current, LAST_GOOD_QUOTA):
+        log(
+            "Accepted quota reset evidence "
+            f"5h reset {LAST_GOOD_QUOTA['primary'].get('reset')} -> {primary.get('reset')}, "
+            f"7d reset {LAST_GOOD_QUOTA['secondary'].get('reset')} -> {secondary.get('reset')}"
+        )
 
     LAST_GOOD_QUOTA = current
     PENDING_QUOTA = None
@@ -361,7 +424,11 @@ def load_quota_cache():
 
 
 def get_cached_quota():
-    return compact_quota_state(LAST_QUOTA_RESULT) or compact_quota_state(LAST_GOOD_QUOTA) or load_quota_cache()
+    return (
+        compact_quota_state(LAST_QUOTA_RESULT)
+        or compact_quota_state(LAST_GOOD_QUOTA)
+        or load_quota_cache()
+    )
 
 
 def seed_last_good_from_cache(state):
@@ -812,7 +879,9 @@ async def send_loop():
                     log(
                         f"Sent {payload.get('updated')} | "
                         f"5h {primary.get('remaining')}% | 7d {secondary.get('remaining')}% | "
-                        f"{payload.get('status')}"
+                        f"{payload.get('status')} | "
+                        f"reset {primary.get('reset')}/{secondary.get('reset')} | "
+                        f"dur {primary.get('duration')}/{secondary.get('duration')}"
                     )
                     await asyncio.sleep(REFRESH_SECONDS)
         except Exception as exc:
