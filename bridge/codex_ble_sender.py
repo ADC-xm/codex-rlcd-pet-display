@@ -18,6 +18,7 @@ SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 REFRESH_SECONDS = 10
+STOCK_REFRESH_SECONDS = 60
 CODEX_REFRESH_SECONDS = 30
 CODEX_ERROR_BACKOFF_SECONDS = 120
 REQUEST_TIMEOUT_SECONDS = 15
@@ -35,6 +36,9 @@ PENDING_QUOTA = None
 LAST_QUOTA_RESULT = None
 LAST_CODEX_FETCH_AT = 0
 LAST_CODEX_ERROR_AT = 0
+LAST_STOCKS_RESULT = []
+LAST_STOCKS_FETCH_AT = 0
+LAST_STOCKS_ERROR_AT = 0
 
 STOCKS = [
     {"name": "上证指数", "code": "000001", "secid": "1.000001"},
@@ -333,6 +337,15 @@ def looks_like_bad_full_spike(current, previous):
     )
 
 
+def describe_quota(current):
+    primary = current["primary"]
+    secondary = current["secondary"]
+    return (
+        f"5h {primary.get('remaining')}% reset={primary.get('reset')} dur={primary.get('duration')}; "
+        f"7d {secondary.get('remaining')}% reset={secondary.get('reset')} dur={secondary.get('duration')}"
+    )
+
+
 def stabilize_quota(primary, secondary, plan_type):
     global LAST_GOOD_QUOTA, PENDING_QUOTA
 
@@ -373,7 +386,7 @@ def stabilize_quota(primary, secondary, plan_type):
         cached["cached"] = True
         cached["error"] = (
             f"ignored one-cycle quota spike "
-            f"5h {primary['remaining']}%, 7d {secondary['remaining']}%"
+            f"{describe_quota(current)}"
         )
         log(cached["error"])
         return cached
@@ -452,6 +465,30 @@ def empty_quota():
     }
 
 
+def get_cached_stocks():
+    return list(LAST_STOCKS_RESULT) if isinstance(LAST_STOCKS_RESULT, list) else []
+
+
+def maybe_build_stocks():
+    global LAST_STOCKS_RESULT, LAST_STOCKS_FETCH_AT, LAST_STOCKS_ERROR_AT
+
+    now = time.monotonic()
+    cached = get_cached_stocks()
+    if cached and now - LAST_STOCKS_FETCH_AT < STOCK_REFRESH_SECONDS:
+        return cached
+
+    try:
+        stocks = build_stocks()
+        LAST_STOCKS_RESULT = stocks
+        LAST_STOCKS_FETCH_AT = time.monotonic()
+        LAST_STOCKS_ERROR_AT = 0
+        return stocks
+    except Exception as exc:
+        LAST_STOCKS_ERROR_AT = now
+        log(f"Stock fetch failed: {exc}")
+        return cached
+
+
 def is_codex_running():
     if os.name != "nt":
         return None
@@ -476,11 +513,7 @@ def build_payload():
     now = datetime.now()
     monotonic_now = time.monotonic()
     running = is_codex_running()
-    try:
-        stocks = build_stocks()
-    except Exception as exc:
-        log(f"Stock fetch failed: {exc}")
-        stocks = []
+    stocks = maybe_build_stocks()
 
     cached_quota = get_cached_quota()
     seed_last_good_from_cache(cached_quota)
