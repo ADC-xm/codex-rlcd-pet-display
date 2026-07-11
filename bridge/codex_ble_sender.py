@@ -289,8 +289,11 @@ def reset_advanced(old_window, new_window, expected_duration_mins):
     except (TypeError, ValueError):
         return False
 
-    min_advance_seconds = expected_duration_mins * 60 * 0.5
-    return new_ts - old_ts >= min_advance_seconds
+    # Codex's quota windows behave like rolling windows: after real recovery,
+    # the reset timestamp may move forward by minutes or hours, not always by
+    # a full 5h/7d period. A clear forward move is enough evidence that the
+    # high remaining value is a fresh server state rather than a stale spike.
+    return new_ts - old_ts >= 60
 
 
 def jump_has_reset_evidence(current, previous):
