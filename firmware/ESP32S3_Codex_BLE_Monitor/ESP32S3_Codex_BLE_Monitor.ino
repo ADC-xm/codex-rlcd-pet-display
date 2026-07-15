@@ -92,6 +92,7 @@ struct UsageInfo {
   bool ok = false;
   bool codexRunning = false;
   String status = "waiting";
+  String quotaMode = "dual";
   String plan = "-";
   String error = "";
   String date = "--";
@@ -99,6 +100,13 @@ struct UsageInfo {
   String updated = "--:--:--";
   WindowInfo primary;
   WindowInfo secondary;
+  uint32_t todayTokens = 0;
+  uint32_t inputTokens = 0;
+  uint32_t cachedTokens = 0;
+  uint32_t outputTokens = 0;
+  float estimatedUsd = 0.0f;
+  int sessionCount = 0;
+  uint32_t hourlyTokens[24] = {0};
 };
 
 UsageInfo usage;
@@ -521,51 +529,100 @@ void drawWindow(int x, int y, int w, const WindowInfo &window, const char *fallb
   drawText(x, y + 96, line, u8g2_font_6x12_tf);
 }
 
+void formatTokenCount(uint32_t value, char *output, size_t outputSize) {
+  if (value >= 1000000) {
+    snprintf(output, outputSize, "%.2fM", double(value) / 1000000.0);
+  } else if (value >= 1000) {
+    snprintf(output, outputSize, "%.1fK", double(value) / 1000.0);
+  } else {
+    snprintf(output, outputSize, "%lu", (unsigned long)value);
+  }
+}
+
 void drawScreen(const char *footer) {
   updateRoomSensor();
   display.clearDisplay();
   canvas.drawRectangle(0, 0, LANDSCAPE_WIDTH - 1, LANDSCAPE_HEIGHT - 1, ST7305_COLOR_BLACK);
 
-  canvas.drawFilledRectangle(0, 0, LANDSCAPE_WIDTH - 1, 46, ST7305_COLOR_BLACK);
-  drawText(16, 32, "CODEX BLE", u8g2_font_helvB18_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
+  canvas.drawFilledRectangle(0, 0, LANDSCAPE_WIDTH - 1, 42, ST7305_COLOR_BLACK);
+  drawText(13, 31, "CODEX BLE", u8g2_font_helvB18_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
 
-  char line[96];
+  char line[112];
   snprintf(line, sizeof(line), "BLE: %s  Codex: %s", bleConnected ? "connected" : "waiting",
            usage.status.c_str());
-  drawText(190, 22, line, u8g2_font_7x14_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
-
+  drawText(190, 18, line, u8g2_font_6x12_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
   snprintf(line, sizeof(line), "%s %s  Plan: %s", usage.date.c_str(), usage.time.c_str(), usage.plan.c_str());
-  drawText(190, 39, line, u8g2_font_6x12_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
+  drawText(190, 36, line, u8g2_font_6x12_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
 
+  canvas.drawFilledRectangle(13, 50, 104, 72, ST7305_COLOR_BLACK);
+  drawText(28, 67, "* THINKING", u8g2_font_6x12_tf, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK);
+  snprintf(line, sizeof(line), "LOCAL  %d SESSIONS", usage.sessionCount);
+  drawText(116, 67, line, u8g2_font_6x12_tf);
   if (shtc3Ok) {
     snprintf(line, sizeof(line), "Room %.1fC  %.0f%%RH", roomTempC, roomHumidity);
   } else {
-    snprintf(line, sizeof(line), "Room sensor: --");
+    snprintf(line, sizeof(line), "Room --.-C  --%%RH");
   }
-  drawText(24, 70, line, u8g2_font_helvB12_tf);
-  if (hasPcData) {
-    drawMoodDog(dogX, 92);
-    snprintf(line, sizeof(line), "pet: %s", dogMoodLabel(currentDogMood()));
-    drawText(290, 76, line, u8g2_font_6x12_tf);
-  }
+  drawText(250, 67, line, u8g2_font_helvB10_tf);
 
   if (hasPcData) {
-    drawWindow(24, 120, 160, usage.primary, "5h");
-    canvas.drawLine(200, 88, 200, 258, ST7305_COLOR_BLACK);
-    drawWindow(224, 120, 150, usage.secondary, "7d");
-    if (!usage.ok && usage.error.length()) {
-      drawText(24, 268, "Quota unavailable", u8g2_font_6x12_tf);
+    char totalText[24];
+    char inputText[24];
+    char cachedText[24];
+    char outputText[24];
+    formatTokenCount(usage.todayTokens, totalText, sizeof(totalText));
+    formatTokenCount(usage.inputTokens, inputText, sizeof(inputText));
+    formatTokenCount(usage.cachedTokens, cachedText, sizeof(cachedText));
+    formatTokenCount(usage.outputTokens, outputText, sizeof(outputText));
+
+    drawText(14, 101, "TODAY TOKENS", u8g2_font_helvB12_tf);
+    drawText(14, 138, totalText, u8g2_font_helvB24_tf);
+    snprintf(line, sizeof(line), "EST. API USD   $%.2f", usage.estimatedUsd);
+    drawText(16, 163, line, u8g2_font_helvB12_tf);
+    snprintf(line, sizeof(line), "IN %s  CACHE %s  OUT %s", inputText, cachedText, outputText);
+    drawText(16, 181, line, u8g2_font_6x12_tf);
+
+    canvas.drawRectangle(250, 81, 387, 183, ST7305_COLOR_BLACK);
+    canvas.drawRectangle(251, 82, 386, 182, ST7305_COLOR_BLACK);
+    drawText(262, 103, "WEEK LEFT", u8g2_font_helvB12_tf);
+    if (usage.primary.remaining >= 0) {
+      snprintf(line, sizeof(line), "%d%%", usage.primary.remaining);
+    } else {
+      snprintf(line, sizeof(line), "--%%");
+    }
+    drawText(288, 142, line, u8g2_font_logisoso28_tn);
+    drawBar(263, 149, 111, 15, usage.primary.remaining);
+    snprintf(line, sizeof(line), "RESET  %s", usage.primary.reset.c_str());
+    drawText(263, 178, line, u8g2_font_6x12_tf);
+
+    canvas.drawLine(13, 190, 387, 190, ST7305_COLOR_BLACK);
+    canvas.drawLine(13, 191, 387, 191, ST7305_COLOR_BLACK);
+    drawText(14, 210, "TODAY BY HOUR", u8g2_font_helvB12_tf);
+
+    uint32_t maximum = 1;
+    for (int hour = 0; hour < 24; hour++) {
+      maximum = max(maximum, usage.hourlyTokens[hour]);
+    }
+    const int chartLeft = 17;
+    const int baseline = 262;
+    for (int hour = 0; hour < 24; hour++) {
+      int x = chartLeft + hour * 15;
+      int barHeight = usage.hourlyTokens[hour] > 0
+                          ? max(2, int(38ULL * usage.hourlyTokens[hour] / maximum))
+                          : 2;
+      canvas.drawFilledRectangle(x, baseline - barHeight, x + 9, baseline, ST7305_COLOR_BLACK);
+      if (hour % 3 == 0) {
+        snprintf(line, sizeof(line), "%02d", hour);
+        drawText(x, 278, line, u8g2_font_5x8_tf);
+      }
     }
   } else {
     drawText(24, 128, "Waiting for PC data", u8g2_font_helvB18_tf);
     drawText(24, 170, "Run codex_ble_sender.py", u8g2_font_7x14_tf);
-    if (usage.error.length()) {
-      drawText(24, 210, usage.error.c_str(), u8g2_font_7x14_tf);
-    }
   }
 
-  drawText(16, 286, footer, u8g2_font_6x12_tf);
-  drawBatteryStatus(306, 286);
+  drawText(14, 292, "LOCAL LOGS | GPT-5.6 EST. | BLE 10s", u8g2_font_5x8_tf);
+  drawBatteryStatus(306, 292);
   wakeDisplay();
   display.display();
   lastDisplayDrawMs = millis();
@@ -689,13 +746,32 @@ void handleJsonLine(const String &line) {
   usage.ok = doc["ok"] | false;
   usage.codexRunning = doc["codex_running"] | false;
   usage.status = doc["status"] | "-";
+  usage.quotaMode = doc["quota_mode"] | "dual";
   usage.plan = doc["plan_type"] | "-";
   usage.date = doc["date"] | "--";
   usage.time = doc["time"] | "--:--:--";
   usage.updated = doc["updated"] | "--:--:--";
   usage.error = doc["error"] | "";
-  usage.primary = parseWindow(doc["primary"], "5h");
+  usage.primary = parseWindow(doc["primary"], usage.quotaMode == "weekly" ? "WEEKLY" : "5h");
   usage.secondary = parseWindow(doc["secondary"], "7d");
+  JsonObjectConst tokens = doc["tokens"].as<JsonObjectConst>();
+  usage.todayTokens = tokens["total"] | 0;
+  usage.inputTokens = tokens["input"] | 0;
+  usage.cachedTokens = tokens["cached"] | 0;
+  usage.outputTokens = tokens["output"] | 0;
+  usage.estimatedUsd = tokens["usd"] | 0.0f;
+  usage.sessionCount = tokens["sessions"] | 0;
+  for (int hour = 0; hour < 24; hour++) {
+    usage.hourlyTokens[hour] = 0;
+  }
+  JsonArrayConst hourly = tokens["hourly"].as<JsonArrayConst>();
+  int hourIndex = 0;
+  for (JsonVariantConst value : hourly) {
+    if (hourIndex >= 24) {
+      break;
+    }
+    usage.hourlyTokens[hourIndex++] = value.as<uint32_t>();
+  }
   hasPcData = true;
 
   JsonArrayConst stockArray = doc["stocks"].as<JsonArrayConst>();
