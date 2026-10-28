@@ -117,8 +117,8 @@ The watcher keeps the BLE sender alive. On Windows you can put the `.bat` in the
 
 ## How It Works
 
-1. `codex_ble_sender.py` starts `codex app-server --listen stdio://`.
-2. It calls `account/rateLimits/read`.
+1. `codex_ble_sender.py` uses `codex_quota_refresh.py` to run a bounded background account query through `codex app-server --listen stdio://`.
+2. It calls `account/rateLimits/read` about every 60 seconds plus polling delay. This works without new chat messages or session-log quota events. Queries time out after 15 seconds and failed attempts back off to at most five minutes; BLE sending continues independently.
 3. It builds a compact JSON payload containing quota, time, and optional stock data.
 4. It sends the JSON over BLE in chunks to the ESP32-S3.
 5. The firmware redraws the RLCD home page and updates the mood pet.
@@ -137,6 +137,26 @@ Example payload shape:
 ```
 
 ## Notes
+
+- The current firmware cycles through the token/quota dashboard, stocks, and an away-message page.
+- Token accounting uses each local call's model, cache usage and service tier. Unknown prices display `--` instead of zero. See [accounting details](docs/PRICING.md) for the stored rate-table date and scope.
+- Local session snapshots can bridge startup before the first account response. After that, an old session snapshot cannot overwrite a newer account response. A response older than two minutes is treated as cached while retrying.
+- The existing watcher restarts the sender after an exit or stale heartbeat. Background account queries do not create model turns or change login settings.
+
+## Tests
+
+After installing `requirements.txt`, run from the repository root:
+
+```powershell
+python -B -m unittest discover -s tests -p "test_*.py" -v
+python -B tests/test_token_usage_regression.py
+```
+
+These checks cover quota polling, timeouts, failure recovery, token accounting,
+duplicate events, subagent filtering and display integer bounds. They do not
+require a board or a live account query.
+
+## Privacy
 
 - This is a hobby desktop display, not an official OpenAI product.
 - The BLE link is local between your PC and ESP32-S3.

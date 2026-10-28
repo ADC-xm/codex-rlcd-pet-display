@@ -1,16 +1,19 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
 from bleak import BleakClient, BleakScanner
+from codex_token_accounting import summarize_usage
+from codex_quota_refresh import QuotaRefresh
 
 
 DEVICE_NAME = "ESP32S3-Codex"
@@ -18,17 +21,29 @@ SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 REFRESH_SECONDS = 10
-STOCK_REFRESH_SECONDS = 60
-CODEX_REFRESH_SECONDS = 30
-CODEX_ERROR_BACKOFF_SECONDS = 120
+STOCK_REFRESH_SECONDS = 10
+CODEX_REFRESH_SECONDS = 10
+# Local snapshots bridge startup while the active account query runs.
+CODEX_ERROR_BACKOFF_SECONDS = 10
 REQUEST_TIMEOUT_SECONDS = 15
+# This can be disabled with CODEX_BLE_ENABLE_QUOTA_READ=0 if Codex account
+# authentication becomes unstable on a particular desktop installation.
+CODEX_QUOTA_FETCH_ENABLED = os.environ.get("CODEX_BLE_ENABLE_QUOTA_READ", "1") == "1"
 PRIMARY_WINDOW_MINS = 5 * 60
 SECONDARY_WINDOW_MINS = 7 * 24 * 60
 APP_NAME = "Codex BLE Sender"
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "codex_ble_sender.log"
+HEARTBEAT_PATH = ROOT / "codex_ble_sender.heartbeat"
 QUOTA_CACHE_PATH = ROOT / "codex_quota_cache.json"
+CODEX_HOME = Path.home() / ".codex"
+TOKEN_REFRESH_SECONDS = 10
+TOKEN_SCAN_WARN_SECONDS = 5
+MAX_TOKEN_JUMP_PER_SCAN = 500_000_000
+TOKEN_ANOMALY_CONFIRMATIONS = 3
+UINT32_MAX = 0xFFFFFFFF
 BLE_CHUNK_SIZE = 160
+BLE_WRITE_TIMEOUT_SECONDS = 10
 HTTP = requests.Session()
 HTTP.trust_env = False
 LAST_GOOD_QUOTA = None
@@ -39,6 +54,15 @@ LAST_CODEX_ERROR_AT = 0
 LAST_STOCKS_RESULT = []
 LAST_STOCKS_FETCH_AT = 0
 LAST_STOCKS_ERROR_AT = 0
+STOCK_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stock-refresh")
+STOCK_FETCH_FUTURE = None
+LAST_TOKEN_RESULT = None
+LAST_TOKEN_FETCH_AT = 0
+LAST_TOKEN_DATE = None
+PENDING_TOKEN_RESULT = None
+PENDING_TOKEN_KIND = None
+PENDING_TOKEN_COUNT = 0
+QUOTA_REFRESH = QuotaRefresh()
 
 STOCKS = [
     {"name": "上证指数", "code": "000001", "secid": "1.000001"},
@@ -61,6 +85,13 @@ def log(message):
             fh.write(text + "\n")
     except Exception:
         pass
+
+
+def write_heartbeat():
+    try:
+        HEARTBEAT_PATH.write_text(str(time.time()), encoding="ascii")
+    except Exception as exc:
+        log(f"Heartbeat write failed: {exc}")
 
 
 def load_codex_env():
@@ -129,7 +160,7 @@ def read_response(proc, expected_id, deadline):
     raise TimeoutError("Codex app-server did not respond in time.")
 
 
-def fetch_rate_limits():
+def fetch_rate_limits_via_app_server():
     codex_exe = find_codex_exe()
     env = load_codex_env()
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -169,6 +200,77 @@ def fetch_rate_limits():
             proc.kill()
         except Exception:
             pass
+
+
+def rate_limit_window_from_log(window):
+    if not isinstance(window, dict):
+        return None
+    return {
+        "usedPercent": window.get("used_percent"),
+        "windowDurationMins": window.get("window_minutes"),
+        "resetsAt": window.get("resets_at"),
+    }
+
+
+def fetch_rate_limits():
+    active = QUOTA_REFRESH.poll(log)
+    if active is not None:
+        return active
+    # Do not replace a newer account response with an older session snapshot.
+    if QUOTA_REFRESH.received_at is not None:
+        raise RuntimeError(QUOTA_REFRESH.error or "Waiting for fresh account quota")
+    candidates = []
+    for root in (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"):
+        if not root.exists():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                pass
+
+    newest = None
+    # Active and recently resumed threads are always among the newest files.
+    for _, path in sorted(candidates, reverse=True)[:40]:
+        try:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - 2 * 1024 * 1024))
+                tail = handle.read().decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        for raw in reversed(tail.splitlines()):
+            if '"type":"token_count"' not in raw or '"rate_limits"' not in raw:
+                continue
+            try:
+                row = json.loads(raw)
+                timestamp = parse_session_timestamp(row.get("timestamp", ""))
+                payload = row.get("payload") or {}
+                limits = payload.get("rate_limits") or {}
+            except Exception:
+                continue
+            if timestamp is None or not isinstance(limits.get("primary"), dict):
+                continue
+            if (limits.get("limit_id") or "codex") != "codex":
+                continue
+            if newest is None or timestamp > newest[0]:
+                newest = (timestamp, limits)
+            break
+
+    if newest is None:
+        raise RuntimeError("No local Codex account rate-limit snapshot is available.")
+
+    timestamp, limits = newest
+    if datetime.now().astimezone() - timestamp > timedelta(minutes=10):
+        raise RuntimeError("Latest local Codex rate-limit snapshot is stale.")
+
+    snapshot = {
+        "primary": rate_limit_window_from_log(limits.get("primary")),
+        "secondary": rate_limit_window_from_log(limits.get("secondary")),
+        "planType": limits.get("plan_type") or "unknown",
+    }
+    return {"rateLimitsByLimitId": {"codex": snapshot}}
 
 
 def clamp_percent(value):
@@ -223,6 +325,40 @@ def snapshot_has_quota(item):
     )
 
 
+def snapshot_has_weekly_quota(item):
+    return (
+        isinstance(item, dict)
+        and isinstance(item.get("primary"), dict)
+        and item.get("secondary") is None
+        and duration_matches(item["primary"].get("windowDurationMins"), SECONDARY_WINDOW_MINS)
+    )
+
+
+def rate_limit_shape(response):
+    if not isinstance(response, dict):
+        return type(response).__name__
+    summary = {"top": sorted(response.keys())}
+    for key, value in response.items():
+        if isinstance(value, dict):
+            summary[key] = sorted(value.keys())
+            if key == "rateLimitsByLimitId":
+                nested = {}
+                for item_key, item in value.items():
+                    if not isinstance(item, dict):
+                        nested[item_key] = type(item).__name__
+                        continue
+                    nested[item_key] = {}
+                    for window_key in ("primary", "secondary"):
+                        window = item.get(window_key)
+                        nested[item_key][window_key] = (
+                            {"keys": sorted(window.keys()), "duration": window.get("windowDurationMins")}
+                            if isinstance(window, dict)
+                            else type(window).__name__
+                        )
+                summary[key] = nested
+    return json.dumps(summary, ensure_ascii=True, separators=(",", ":"))
+
+
 def pick_snapshot(response):
     if not isinstance(response, dict):
         raise RuntimeError("Unexpected Codex response.")
@@ -231,15 +367,28 @@ def pick_snapshot(response):
     if isinstance(by_id, dict):
         if snapshot_has_quota(by_id.get("codex")):
             return by_id["codex"]
+        if snapshot_has_weekly_quota(by_id.get("codex")):
+            snapshot = dict(by_id["codex"])
+            snapshot["_quota_mode"] = "weekly"
+            return snapshot
         for limit_id, item in by_id.items():
             if snapshot_has_quota(item):
                 log(f"Using Codex rate-limit snapshot id: {limit_id}")
                 return item
+            if snapshot_has_weekly_quota(item):
+                log(f"Using weekly Codex rate-limit snapshot id: {limit_id}")
+                snapshot = dict(item)
+                snapshot["_quota_mode"] = "weekly"
+                return snapshot
 
     if snapshot_has_quota(response.get("rateLimits")):
         return response["rateLimits"]
+    if snapshot_has_weekly_quota(response.get("rateLimits")):
+        snapshot = dict(response["rateLimits"])
+        snapshot["_quota_mode"] = "weekly"
+        return snapshot
 
-    raise RuntimeError("No Codex rate-limit snapshot was returned.")
+    raise RuntimeError(f"No Codex rate-limit snapshot was returned: {rate_limit_shape(response)}")
 
 
 def has_valid_quota(primary, secondary):
@@ -250,6 +399,14 @@ def has_valid_quota(primary, secondary):
         and 0 <= primary.get("remaining", -1) <= 100
         and 0 <= secondary.get("used", -1) <= 100
         and 0 <= secondary.get("remaining", -1) <= 100
+    )
+
+
+def has_valid_window(window):
+    return (
+        isinstance(window, dict)
+        and 0 <= window.get("used", -1) <= 100
+        and 0 <= window.get("remaining", -1) <= 100
     )
 
 
@@ -411,12 +568,23 @@ def compact_quota_state(state):
         return None
     primary = state.get("primary")
     secondary = state.get("secondary")
+    quota_mode = state.get("quota_mode") or "dual"
+    if quota_mode == "weekly":
+        if not has_valid_window(primary) or not duration_matches(primary.get("duration"), SECONDARY_WINDOW_MINS):
+            return None
+        return {
+            "primary": dict(primary),
+            "secondary": dict(secondary) if isinstance(secondary, dict) else empty_quota()["secondary"],
+            "plan_type": state.get("plan_type") or "unknown",
+            "quota_mode": "weekly",
+        }
     if not has_valid_quota(primary, secondary):
         return None
     return {
         "primary": dict(primary),
         "secondary": dict(secondary),
         "plan_type": state.get("plan_type") or "unknown",
+        "quota_mode": "dual",
     }
 
 
@@ -450,7 +618,7 @@ def get_cached_quota():
 def seed_last_good_from_cache(state):
     global LAST_GOOD_QUOTA
     compact = compact_quota_state(state)
-    if LAST_GOOD_QUOTA is None and compact:
+    if LAST_GOOD_QUOTA is None and compact and compact.get("quota_mode") != "weekly":
         LAST_GOOD_QUOTA = {
             "primary": compact["primary"],
             "secondary": compact["secondary"],
@@ -465,6 +633,7 @@ def empty_quota():
         "primary": {"label": "5h", "used": -1, "remaining": -1, "reset": "-"},
         "secondary": {"label": "7d", "used": -1, "remaining": -1, "reset": "-"},
         "plan_type": "-",
+        "quota_mode": "dual",
     }
 
 
@@ -473,23 +642,42 @@ def get_cached_stocks():
 
 
 def maybe_build_stocks():
-    global LAST_STOCKS_RESULT, LAST_STOCKS_FETCH_AT, LAST_STOCKS_ERROR_AT
+    global LAST_STOCKS_RESULT, LAST_STOCKS_FETCH_AT, LAST_STOCKS_ERROR_AT, STOCK_FETCH_FUTURE
 
     now = time.monotonic()
     cached = get_cached_stocks()
-    if cached and now - LAST_STOCKS_FETCH_AT < STOCK_REFRESH_SECONDS:
-        return cached
 
-    try:
-        stocks = build_stocks()
-        LAST_STOCKS_RESULT = stocks
-        LAST_STOCKS_FETCH_AT = time.monotonic()
-        LAST_STOCKS_ERROR_AT = 0
-        return stocks
-    except Exception as exc:
-        LAST_STOCKS_ERROR_AT = now
-        log(f"Stock fetch failed: {exc}")
-        return cached
+    # Seed the display once, then keep network work off the BLE send loop.
+    if not cached:
+        try:
+            stocks = build_stocks()
+            LAST_STOCKS_RESULT = stocks
+            LAST_STOCKS_FETCH_AT = time.monotonic()
+            LAST_STOCKS_ERROR_AT = 0
+            return stocks
+        except Exception as exc:
+            LAST_STOCKS_ERROR_AT = now
+            log(f"Initial stock fetch failed: {exc}")
+            return cached
+
+    if STOCK_FETCH_FUTURE is not None and STOCK_FETCH_FUTURE.done():
+        try:
+            LAST_STOCKS_RESULT = STOCK_FETCH_FUTURE.result()
+            LAST_STOCKS_FETCH_AT = time.monotonic()
+            LAST_STOCKS_ERROR_AT = 0
+        except Exception as exc:
+            LAST_STOCKS_ERROR_AT = now
+            LAST_STOCKS_FETCH_AT = now
+            log(f"Stock fetch failed: {exc}")
+        STOCK_FETCH_FUTURE = None
+
+    if (
+        STOCK_FETCH_FUTURE is None
+        and now - LAST_STOCKS_FETCH_AT >= STOCK_REFRESH_SECONDS
+    ):
+        STOCK_FETCH_FUTURE = STOCK_FETCH_EXECUTOR.submit(build_stocks)
+
+    return get_cached_stocks()
 
 
 def is_codex_running():
@@ -510,6 +698,139 @@ def is_codex_running():
         return None
 
 
+def parse_session_timestamp(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return None
+
+
+def is_subagent_session(path):
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(8):
+                raw = next(handle, "")
+                if not raw:
+                    break
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                if row.get("type") != "session_meta":
+                    continue
+                payload = row.get("payload") or {}
+                source = payload.get("source")
+                return bool(
+                    payload.get("forked_from_id")
+                    or payload.get("thread_source") == "subagent"
+                    or (isinstance(source, dict) and source.get("subagent"))
+                )
+    except OSError:
+        pass
+    return None
+
+
+def collect_token_usage():
+    local_now = datetime.now().astimezone()
+    today = local_now.date()
+    day_start_timestamp = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    files = []
+    for root in (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"):
+        if root.exists():
+            for path in root.rglob("*.jsonl"):
+                try:
+                    if path.stat().st_mtime >= day_start_timestamp:
+                        files.append(path)
+                except OSError:
+                    continue
+
+    # Preserve the dashboard's local, non-forked session scope.
+    files = [path for path in files if is_subagent_session(path) is False]
+    return summarize_usage(files, today)
+
+
+def stabilize_token_usage(result):
+    global LAST_TOKEN_DATE, PENDING_TOKEN_RESULT, PENDING_TOKEN_KIND, PENDING_TOKEN_COUNT
+
+    today_key = datetime.now().astimezone().date().isoformat()
+    safe = dict(result)
+    overflowed = False
+    for key in ("total", "input", "cached", "output"):
+        value = max(0, int(safe.get(key, 0) or 0))
+        overflowed = overflowed or value > UINT32_MAX
+        safe[key] = min(value, UINT32_MAX)
+    safe_hourly = []
+    for value in safe.get("hourly", [])[:24]:
+        value = max(0, int(value or 0))
+        overflowed = overflowed or value > UINT32_MAX
+        safe_hourly.append(min(value, UINT32_MAX))
+    safe["hourly"] = (safe_hourly + [0] * 24)[:24]
+    if overflowed:
+        log("Token values exceeded the ESP32 uint32 range and were safely clamped")
+
+    total = safe["total"]
+    anomaly_kind = None
+    previous_total = None
+    if LAST_TOKEN_RESULT is not None and LAST_TOKEN_DATE == today_key:
+        previous_total = max(0, int(LAST_TOKEN_RESULT.get("total", 0) or 0))
+        if total < previous_total:
+            anomaly_kind = "backward"
+        elif total - previous_total > MAX_TOKEN_JUMP_PER_SCAN:
+            anomaly_kind = "jump"
+
+    if anomaly_kind is not None:
+        pending_total = int((PENDING_TOKEN_RESULT or {}).get("total", -1) or -1)
+        if PENDING_TOKEN_KIND == anomaly_kind and total >= pending_total:
+            PENDING_TOKEN_COUNT += 1
+        else:
+            PENDING_TOKEN_COUNT = 1
+        PENDING_TOKEN_RESULT = safe
+        PENDING_TOKEN_KIND = anomaly_kind
+        if PENDING_TOKEN_COUNT < TOKEN_ANOMALY_CONFIRMATIONS or total <= 0 or not safe.get("sessions"):
+            log(
+                f"Token anomaly {anomaly_kind} ({previous_total} -> {total}); "
+                f"confirmation {PENDING_TOKEN_COUNT}/{TOKEN_ANOMALY_CONFIRMATIONS}"
+            )
+            return LAST_TOKEN_RESULT
+        log(f"Accepted confirmed Token correction ({previous_total} -> {total})")
+
+    PENDING_TOKEN_RESULT = None
+    PENDING_TOKEN_KIND = None
+    PENDING_TOKEN_COUNT = 0
+    LAST_TOKEN_DATE = today_key
+    return safe
+
+
+def maybe_collect_token_usage():
+    global LAST_TOKEN_RESULT, LAST_TOKEN_FETCH_AT
+
+    now = time.monotonic()
+    if LAST_TOKEN_RESULT is not None and now - LAST_TOKEN_FETCH_AT < TOKEN_REFRESH_SECONDS:
+        return LAST_TOKEN_RESULT
+    try:
+        scan_started = time.monotonic()
+        result = collect_token_usage()
+        scan_seconds = time.monotonic() - scan_started
+        if scan_seconds > TOKEN_SCAN_WARN_SECONDS:
+            log(f"Token log scan is slow: {scan_seconds:.1f}s")
+        LAST_TOKEN_RESULT = stabilize_token_usage(result)
+        LAST_TOKEN_FETCH_AT = now
+    except Exception as exc:
+        log(f"Token log scan failed: {exc}")
+        if LAST_TOKEN_RESULT is None:
+            LAST_TOKEN_RESULT = {
+                "total": 0,
+                "input": 0,
+                "cached": 0,
+                "output": 0,
+                "usd": 0.0,
+                "sessions": 0,
+                "hourly": [0] * 24,
+            }
+    return LAST_TOKEN_RESULT
+
+
 def build_payload():
     global LAST_QUOTA_RESULT, LAST_CODEX_FETCH_AT, LAST_CODEX_ERROR_AT
 
@@ -517,14 +838,25 @@ def build_payload():
     monotonic_now = time.monotonic()
     running = is_codex_running()
     stocks = maybe_build_stocks()
+    tokens = maybe_collect_token_usage()
 
     cached_quota = get_cached_quota()
     seed_last_good_from_cache(cached_quota)
-    if running is False:
+    if not CODEX_QUOTA_FETCH_ENABLED:
         quota = cached_quota or empty_quota()
         primary = quota["primary"]
         secondary = quota["secondary"]
         plan_type = quota["plan_type"]
+        quota_mode = quota.get("quota_mode", "dual")
+        ok = cached_quota is not None
+        status = "cached" if cached_quota else "waiting"
+        error = "Automatic Codex quota reads are disabled to protect sign-in"
+    elif running is False:
+        quota = cached_quota or empty_quota()
+        primary = quota["primary"]
+        secondary = quota["secondary"]
+        plan_type = quota["plan_type"]
+        quota_mode = quota.get("quota_mode", "dual")
         ok = cached_quota is not None
         status = "cached" if cached_quota else "waiting"
         error = "Codex not running; quota fetch paused"
@@ -532,6 +864,7 @@ def build_payload():
         primary = cached_quota["primary"]
         secondary = cached_quota["secondary"]
         plan_type = cached_quota["plan_type"]
+        quota_mode = cached_quota.get("quota_mode", "dual")
         ok = True
         status = "running"
         error = ""
@@ -539,6 +872,7 @@ def build_payload():
         primary = cached_quota["primary"]
         secondary = cached_quota["secondary"]
         plan_type = cached_quota["plan_type"]
+        quota_mode = cached_quota.get("quota_mode", "dual")
         ok = True
         status = "cached"
         error = "Codex quota fetch is backing off"
@@ -546,13 +880,27 @@ def build_payload():
         try:
             response = fetch_rate_limits()
             snapshot = pick_snapshot(response)
-            primary = normalize_window(snapshot.get("primary"), "5h")
-            secondary = normalize_window(snapshot.get("secondary"), "7d")
+            quota_mode = snapshot.get("_quota_mode", "dual")
             plan_type = snapshot.get("planType") or "unknown"
-            stable = stabilize_quota(primary, secondary, plan_type)
+            if quota_mode == "weekly":
+                primary = normalize_window(snapshot.get("primary"), "7d")
+                secondary = normalize_window(None, "-")
+                stable = {
+                    "primary": primary,
+                    "secondary": secondary,
+                    "plan_type": plan_type,
+                    "quota_mode": "weekly",
+                    "cached": False,
+                    "error": "",
+                }
+            else:
+                primary = normalize_window(snapshot.get("primary"), "5h")
+                secondary = normalize_window(snapshot.get("secondary"), "7d")
+                stable = stabilize_quota(primary, secondary, plan_type)
             primary = stable["primary"]
             secondary = stable["secondary"]
             plan_type = stable["plan_type"]
+            quota_mode = stable.get("quota_mode", quota_mode)
             ok = True
             status = "cached" if stable["cached"] else "running"
             error = stable["error"]
@@ -568,6 +916,7 @@ def build_payload():
             primary = quota["primary"]
             secondary = quota["secondary"]
             plan_type = quota["plan_type"]
+            quota_mode = quota.get("quota_mode", "dual")
             ok = cached_quota is not None
             status = "cached" if cached_quota else "error"
             error = str(exc)[:80]
@@ -577,12 +926,14 @@ def build_payload():
         "codex_running": running,
         "status": status,
         "plan_type": plan_type,
+        "quota_mode": quota_mode,
         "primary": primary,
         "secondary": secondary,
         "date": now.strftime("%m-%d"),
         "time": now.strftime("%H:%M:%S"),
         "updated": now.strftime("%H:%M:%S"),
         "stocks": stocks,
+        "tokens": tokens,
         "error": error,
     }
 
@@ -605,6 +956,7 @@ def build_error_payload(exc):
         "updated": now.strftime("%H:%M:%S"),
         "error": str(exc)[:80],
         "stocks": stocks,
+        "tokens": maybe_collect_token_usage(),
     }
 
 
@@ -794,8 +1146,8 @@ def fetch_sina_trend(symbol):
 
 def fetch_best_trend(stock):
     sources = (
-        ("eastmoney", lambda: fetch_trend(stock["secid"])),
         ("tencent", lambda: fetch_tencent_trend(stock["sina"])),
+        ("eastmoney", lambda: fetch_trend(stock["secid"])),
         ("sina", lambda: fetch_sina_trend(stock["sina"])),
     )
     errors = []
@@ -832,16 +1184,25 @@ def build_stocks():
         quotes = fetch_sina_quotes()
         source = "sina"
 
+    trends = {}
+    # Fetch all three intraday curves simultaneously. Sequential fallback
+    # fetches made a nominal 10-second stock refresh take roughly 30 seconds.
+    with ThreadPoolExecutor(max_workers=len(STOCKS), thread_name_prefix="stock-trend") as executor:
+        futures = {executor.submit(fetch_best_trend, stock): stock for stock in STOCKS}
+        for future in as_completed(futures):
+            stock = futures[future]
+            try:
+                trend_source, trend = future.result()
+                trends[stock["code"]] = trend
+                if trend_source != source:
+                    log(f"{stock['code']} trend source {trend_source}")
+            except Exception as exc:
+                log(f"{stock['code']} trend failed: {exc}")
+
     output = []
     for stock in STOCKS:
         quote = quotes.get(stock["code"], {})
-        trend = []
-        try:
-            trend_source, trend = fetch_best_trend(stock)
-            if trend_source != source:
-                log(f"{stock['code']} trend source {trend_source}")
-        except Exception as exc:
-            log(f"{stock['code']} trend failed: {exc}")
+        trend = trends.get(stock["code"], [])
         if not trend and quote.get("f2") not in (None, "--"):
             try:
                 current = float(quote.get("f2"))
@@ -900,6 +1261,7 @@ async def send_loop():
                     log(f"Notify unavailable: {exc}")
 
                 while client.is_connected:
+                    cycle_started = time.monotonic()
                     try:
                         payload = build_payload()
                     except Exception as exc:
@@ -908,18 +1270,32 @@ async def send_loop():
                     line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
                     encoded = line.encode("utf-8")
                     for start in range(0, len(encoded), BLE_CHUNK_SIZE):
-                        await client.write_gatt_char(RX_UUID, encoded[start : start + BLE_CHUNK_SIZE], response=True)
+                        await asyncio.wait_for(
+                            client.write_gatt_char(
+                                RX_UUID,
+                                encoded[start : start + BLE_CHUNK_SIZE],
+                                response=True,
+                            ),
+                            timeout=BLE_WRITE_TIMEOUT_SECONDS,
+                        )
                         await asyncio.sleep(0.03)
+                    write_heartbeat()
                     primary = payload.get("primary") or {}
                     secondary = payload.get("secondary") or {}
+                    tokens = payload.get("tokens") or {}
                     log(
                         f"Sent {payload.get('updated')} | "
-                        f"5h {primary.get('remaining')}% | 7d {secondary.get('remaining')}% | "
+                        f"{primary.get('label')} {primary.get('remaining')}% | "
+                        f"{secondary.get('label')} {secondary.get('remaining')}% | "
                         f"{payload.get('status')} | "
                         f"reset {primary.get('reset')}/{secondary.get('reset')} | "
-                        f"dur {primary.get('duration')}/{secondary.get('duration')}"
+                        f"dur {primary.get('duration')}/{secondary.get('duration')} | "
+                        f"tokens {tokens.get('total')} | usd {tokens.get('usd')} | "
+                        f"{tokens.get('pricing_label')} | priced calls "
+                        f"{tokens.get('calls', 0) - tokens.get('unpriced_calls', 0)}/{tokens.get('calls', 0)}"
                     )
-                    await asyncio.sleep(REFRESH_SECONDS)
+                    remaining_delay = REFRESH_SECONDS - (time.monotonic() - cycle_started)
+                    await asyncio.sleep(max(0, remaining_delay))
         except Exception as exc:
             log(f"Connection failed/lost: {exc}. Reconnecting soon.")
 
@@ -929,6 +1305,7 @@ async def send_loop():
 
 def main():
     try:
+        write_heartbeat()
         asyncio.run(send_loop())
     except KeyboardInterrupt:
         log("Stopped.")
