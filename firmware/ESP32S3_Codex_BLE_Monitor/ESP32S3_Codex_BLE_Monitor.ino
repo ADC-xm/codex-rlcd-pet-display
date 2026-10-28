@@ -67,6 +67,36 @@ private:
 
 LandscapeDisplay canvas(display);
 U8G2_FOR_ST73XX u8g2;
+
+class ScaledLandscapeDisplay : public ST73XX_UI {
+public:
+  ScaledLandscapeDisplay(LandscapeDisplay &targetDisplay, uint8_t scaleFactor)
+      : ST73XX_UI(LANDSCAPE_WIDTH / scaleFactor, LANDSCAPE_HEIGHT / scaleFactor),
+        target(targetDisplay), scale(scaleFactor) {}
+
+  void writePoint(uint x, uint y, bool enabled) override {
+    for (uint8_t dx = 0; dx < scale; dx++) {
+      for (uint8_t dy = 0; dy < scale; dy++) {
+        target.writePoint(x * scale + dx, y * scale + dy, enabled);
+      }
+    }
+  }
+
+  void writePoint(uint x, uint y, uint16_t color) override {
+    for (uint8_t dx = 0; dx < scale; dx++) {
+      for (uint8_t dy = 0; dy < scale; dy++) {
+        target.writePoint(x * scale + dx, y * scale + dy, color);
+      }
+    }
+  }
+
+private:
+  LandscapeDisplay &target;
+  uint8_t scale;
+};
+
+ScaledLandscapeDisplay largeCanvas(canvas, 2);
+U8G2_FOR_ST73XX largeText;
 BLECharacteristic *txCharacteristic = nullptr;
 
 enum DogMood {
@@ -104,7 +134,8 @@ struct UsageInfo {
   uint32_t inputTokens = 0;
   uint32_t cachedTokens = 0;
   uint32_t outputTokens = 0;
-  float estimatedUsd = 0.0f;
+  float estimatedUsd = NAN;
+  String pricingLabel = "MODEL EST.";
   int sessionCount = 0;
   uint32_t hourlyTokens[24] = {0};
 };
@@ -577,7 +608,11 @@ void drawScreen(const char *footer) {
 
     drawText(14, 101, "TODAY TOKENS", u8g2_font_helvB12_tf);
     drawText(14, 138, totalText, u8g2_font_helvB24_tf);
-    snprintf(line, sizeof(line), "EST. API USD   $%.2f", usage.estimatedUsd);
+    if (isnan(usage.estimatedUsd)) {
+      snprintf(line, sizeof(line), "EST. API USD   --");
+    } else {
+      snprintf(line, sizeof(line), "EST. API USD   $%.2f", usage.estimatedUsd);
+    }
     drawText(16, 163, line, u8g2_font_helvB12_tf);
     snprintf(line, sizeof(line), "IN %s  CACHE %s  OUT %s", inputText, cachedText, outputText);
     drawText(16, 181, line, u8g2_font_6x12_tf);
@@ -621,7 +656,8 @@ void drawScreen(const char *footer) {
     drawText(24, 170, "Run codex_ble_sender.py", u8g2_font_7x14_tf);
   }
 
-  drawText(14, 292, "LOCAL LOGS | GPT-5.6 EST. | BLE 10s", u8g2_font_5x8_tf);
+  snprintf(line, sizeof(line), "LOCAL LOGS | %.13s | BLE 10s", usage.pricingLabel.c_str());
+  drawText(14, 292, line, u8g2_font_5x8_tf);
   drawBatteryStatus(306, 292);
   wakeDisplay();
   display.display();
@@ -702,12 +738,41 @@ void drawStocksScreen(const char *footer) {
   lastDisplayDrawMs = millis();
 }
 
+void drawAwayScreen() {
+  display.clearDisplay();
+  canvas.drawRectangle(0, 0, LANDSCAPE_WIDTH - 1, LANDSCAPE_HEIGHT - 1, ST7305_COLOR_BLACK);
+  canvas.drawRectangle(5, 5, LANDSCAPE_WIDTH - 6, LANDSCAPE_HEIGHT - 6, ST7305_COLOR_BLACK);
+
+  const char *lines[] = {
+      "临时有事，",
+      "休息一下，",
+      "马上回来，",
+      "有事微信联系~",
+  };
+  const int baselines[] = {37, 70, 103, 136};
+
+  largeText.setFont(u8g2_font_wqy16_t_gb2312b);
+  largeText.setForegroundColor(ST7305_COLOR_BLACK);
+  largeText.setBackgroundColor(ST7305_COLOR_WHITE);
+  for (int i = 0; i < 4; i++) {
+    int width = largeText.getUTF8Width(lines[i]);
+    int x = max(4, (LANDSCAPE_WIDTH / 2 - width) / 2);
+    largeText.drawUTF8(x, baselines[i], lines[i]);
+  }
+
+  wakeDisplay();
+  display.display();
+  lastDisplayDrawMs = millis();
+}
+
 void drawCurrentPage(const char *footer) {
   currentFooter = footer;
   if (currentPage == 0) {
     drawScreen(footer);
-  } else {
+  } else if (currentPage == 1) {
     drawStocksScreen(footer);
+  } else {
+    drawAwayScreen();
   }
 }
 
@@ -759,7 +824,8 @@ void handleJsonLine(const String &line) {
   usage.inputTokens = tokens["input"] | 0;
   usage.cachedTokens = tokens["cached"] | 0;
   usage.outputTokens = tokens["output"] | 0;
-  usage.estimatedUsd = tokens["usd"] | 0.0f;
+  usage.estimatedUsd = tokens["usd"].isNull() ? NAN : tokens["usd"].as<float>();
+  usage.pricingLabel = tokens["pricing_label"] | "MODEL EST.";
   usage.sessionCount = tokens["sessions"] | 0;
   for (int hour = 0; hour < 24; hour++) {
     usage.hourlyTokens[hour] = 0;
@@ -896,6 +962,8 @@ void setup() {
   display.display_Inversion(false);
   u8g2.begin(canvas);
   u8g2.setFontMode(1);
+  largeText.begin(largeCanvas);
+  largeText.setFontMode(1);
 
   drawCurrentPage("Starting BLE...");
   setupBle();
@@ -913,8 +981,10 @@ void loop() {
 
   if (keyDown && !lastKeyDown && millis() - lastKeyMs > 250) {
     lastKeyMs = millis();
-    currentPage = currentPage == 0 ? 1 : 0;
-    requestRedraw(currentPage == 0 ? "Page: Codex" : "Page: Stocks");
+    currentPage = (currentPage + 1) % 3;
+    const char *pageName = currentPage == 0 ? "Page: Codex" :
+                           currentPage == 1 ? "Page: Stocks" : "Page: Away";
+    requestRedraw(pageName);
   }
   lastKeyDown = keyDown;
 

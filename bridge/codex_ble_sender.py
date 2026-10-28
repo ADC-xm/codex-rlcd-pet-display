@@ -6,12 +6,14 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
 from bleak import BleakClient, BleakScanner
+from codex_token_accounting import summarize_usage
+from codex_quota_refresh import QuotaRefresh
 
 
 DEVICE_NAME = "ESP32S3-Codex"
@@ -21,7 +23,8 @@ TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 REFRESH_SECONDS = 10
 STOCK_REFRESH_SECONDS = 10
 CODEX_REFRESH_SECONDS = 10
-CODEX_ERROR_BACKOFF_SECONDS = 120
+# Local snapshots bridge startup while the active account query runs.
+CODEX_ERROR_BACKOFF_SECONDS = 10
 REQUEST_TIMEOUT_SECONDS = 15
 # This can be disabled with CODEX_BLE_ENABLE_QUOTA_READ=0 if Codex account
 # authentication becomes unstable on a particular desktop installation.
@@ -31,13 +34,16 @@ SECONDARY_WINDOW_MINS = 7 * 24 * 60
 APP_NAME = "Codex BLE Sender"
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "codex_ble_sender.log"
+HEARTBEAT_PATH = ROOT / "codex_ble_sender.heartbeat"
 QUOTA_CACHE_PATH = ROOT / "codex_quota_cache.json"
 CODEX_HOME = Path.home() / ".codex"
 TOKEN_REFRESH_SECONDS = 10
-TOKEN_INPUT_USD_PER_MTOK = 5.00
-TOKEN_CACHED_USD_PER_MTOK = 0.50
-TOKEN_OUTPUT_USD_PER_MTOK = 30.00
+TOKEN_SCAN_WARN_SECONDS = 5
+MAX_TOKEN_JUMP_PER_SCAN = 500_000_000
+TOKEN_ANOMALY_CONFIRMATIONS = 3
+UINT32_MAX = 0xFFFFFFFF
 BLE_CHUNK_SIZE = 160
+BLE_WRITE_TIMEOUT_SECONDS = 10
 HTTP = requests.Session()
 HTTP.trust_env = False
 LAST_GOOD_QUOTA = None
@@ -52,6 +58,11 @@ STOCK_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sto
 STOCK_FETCH_FUTURE = None
 LAST_TOKEN_RESULT = None
 LAST_TOKEN_FETCH_AT = 0
+LAST_TOKEN_DATE = None
+PENDING_TOKEN_RESULT = None
+PENDING_TOKEN_KIND = None
+PENDING_TOKEN_COUNT = 0
+QUOTA_REFRESH = QuotaRefresh()
 
 STOCKS = [
     {"name": "上证指数", "code": "000001", "secid": "1.000001"},
@@ -74,6 +85,13 @@ def log(message):
             fh.write(text + "\n")
     except Exception:
         pass
+
+
+def write_heartbeat():
+    try:
+        HEARTBEAT_PATH.write_text(str(time.time()), encoding="ascii")
+    except Exception as exc:
+        log(f"Heartbeat write failed: {exc}")
 
 
 def load_codex_env():
@@ -142,7 +160,7 @@ def read_response(proc, expected_id, deadline):
     raise TimeoutError("Codex app-server did not respond in time.")
 
 
-def fetch_rate_limits():
+def fetch_rate_limits_via_app_server():
     codex_exe = find_codex_exe()
     env = load_codex_env()
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -182,6 +200,77 @@ def fetch_rate_limits():
             proc.kill()
         except Exception:
             pass
+
+
+def rate_limit_window_from_log(window):
+    if not isinstance(window, dict):
+        return None
+    return {
+        "usedPercent": window.get("used_percent"),
+        "windowDurationMins": window.get("window_minutes"),
+        "resetsAt": window.get("resets_at"),
+    }
+
+
+def fetch_rate_limits():
+    active = QUOTA_REFRESH.poll(log)
+    if active is not None:
+        return active
+    # Do not replace a newer account response with an older session snapshot.
+    if QUOTA_REFRESH.received_at is not None:
+        raise RuntimeError(QUOTA_REFRESH.error or "Waiting for fresh account quota")
+    candidates = []
+    for root in (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"):
+        if not root.exists():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                pass
+
+    newest = None
+    # Active and recently resumed threads are always among the newest files.
+    for _, path in sorted(candidates, reverse=True)[:40]:
+        try:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - 2 * 1024 * 1024))
+                tail = handle.read().decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        for raw in reversed(tail.splitlines()):
+            if '"type":"token_count"' not in raw or '"rate_limits"' not in raw:
+                continue
+            try:
+                row = json.loads(raw)
+                timestamp = parse_session_timestamp(row.get("timestamp", ""))
+                payload = row.get("payload") or {}
+                limits = payload.get("rate_limits") or {}
+            except Exception:
+                continue
+            if timestamp is None or not isinstance(limits.get("primary"), dict):
+                continue
+            if (limits.get("limit_id") or "codex") != "codex":
+                continue
+            if newest is None or timestamp > newest[0]:
+                newest = (timestamp, limits)
+            break
+
+    if newest is None:
+        raise RuntimeError("No local Codex account rate-limit snapshot is available.")
+
+    timestamp, limits = newest
+    if datetime.now().astimezone() - timestamp > timedelta(minutes=10):
+        raise RuntimeError("Latest local Codex rate-limit snapshot is stale.")
+
+    snapshot = {
+        "primary": rate_limit_window_from_log(limits.get("primary")),
+        "secondary": rate_limit_window_from_log(limits.get("secondary")),
+        "planType": limits.get("plan_type") or "unknown",
+    }
+    return {"rateLimitsByLimitId": {"codex": snapshot}}
 
 
 def clamp_percent(value):
@@ -616,77 +705,101 @@ def parse_session_timestamp(value):
         return None
 
 
-def collect_token_usage():
-    today = datetime.now().astimezone().date()
-    totals = {"total": 0, "input": 0, "cached": 0, "output": 0}
-    hourly = [0] * 24
-    session_count = 0
-
-    files = []
-    for root in (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"):
-        if root.exists():
-            files.extend(root.rglob("*.jsonl"))
-
-    for path in files:
-        previous = {
-            "input_tokens": 0,
-            "cached_input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        }
-        saw_today = False
-        try:
-            lines = path.open("r", encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-
-        with lines:
-            for raw in lines:
+def is_subagent_session(path):
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(8):
+                raw = next(handle, "")
+                if not raw:
+                    break
                 try:
                     row = json.loads(raw)
                 except Exception:
                     continue
+                if row.get("type") != "session_meta":
+                    continue
                 payload = row.get("payload") or {}
-                if row.get("type") != "event_msg" or payload.get("type") != "token_count":
-                    continue
-                current = ((payload.get("info") or {}).get("total_token_usage") or {})
-                if not current:
-                    continue
-                timestamp = parse_session_timestamp(row.get("timestamp", ""))
-                if timestamp is None:
+                source = payload.get("source")
+                return bool(
+                    payload.get("forked_from_id")
+                    or payload.get("thread_source") == "subagent"
+                    or (isinstance(source, dict) and source.get("subagent"))
+                )
+    except OSError:
+        pass
+    return None
+
+
+def collect_token_usage():
+    local_now = datetime.now().astimezone()
+    today = local_now.date()
+    day_start_timestamp = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    files = []
+    for root in (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"):
+        if root.exists():
+            for path in root.rglob("*.jsonl"):
+                try:
+                    if path.stat().st_mtime >= day_start_timestamp:
+                        files.append(path)
+                except OSError:
                     continue
 
-                delta = {}
-                for key in previous:
-                    value = int(current.get(key, 0) or 0)
-                    delta[key] = value - previous[key] if value >= previous[key] else value
-                    previous[key] = value
+    # Preserve the dashboard's local, non-forked session scope.
+    files = [path for path in files if is_subagent_session(path) is False]
+    return summarize_usage(files, today)
 
-                if timestamp.date() != today:
-                    continue
-                saw_today = True
-                uncached = max(0, delta["input_tokens"] - delta["cached_input_tokens"])
-                totals["input"] += uncached
-                totals["cached"] += max(0, delta["cached_input_tokens"])
-                totals["output"] += max(0, delta["output_tokens"])
-                token_delta = max(0, delta["total_tokens"])
-                totals["total"] += token_delta
-                hourly[timestamp.hour] += token_delta
 
-        if saw_today:
-            session_count += 1
+def stabilize_token_usage(result):
+    global LAST_TOKEN_DATE, PENDING_TOKEN_RESULT, PENDING_TOKEN_KIND, PENDING_TOKEN_COUNT
 
-    usd = (
-        totals["input"] * TOKEN_INPUT_USD_PER_MTOK
-        + totals["cached"] * TOKEN_CACHED_USD_PER_MTOK
-        + totals["output"] * TOKEN_OUTPUT_USD_PER_MTOK
-    ) / 1_000_000
-    return {
-        **totals,
-        "usd": round(usd, 2),
-        "sessions": session_count,
-        "hourly": hourly,
-    }
+    today_key = datetime.now().astimezone().date().isoformat()
+    safe = dict(result)
+    overflowed = False
+    for key in ("total", "input", "cached", "output"):
+        value = max(0, int(safe.get(key, 0) or 0))
+        overflowed = overflowed or value > UINT32_MAX
+        safe[key] = min(value, UINT32_MAX)
+    safe_hourly = []
+    for value in safe.get("hourly", [])[:24]:
+        value = max(0, int(value or 0))
+        overflowed = overflowed or value > UINT32_MAX
+        safe_hourly.append(min(value, UINT32_MAX))
+    safe["hourly"] = (safe_hourly + [0] * 24)[:24]
+    if overflowed:
+        log("Token values exceeded the ESP32 uint32 range and were safely clamped")
+
+    total = safe["total"]
+    anomaly_kind = None
+    previous_total = None
+    if LAST_TOKEN_RESULT is not None and LAST_TOKEN_DATE == today_key:
+        previous_total = max(0, int(LAST_TOKEN_RESULT.get("total", 0) or 0))
+        if total < previous_total:
+            anomaly_kind = "backward"
+        elif total - previous_total > MAX_TOKEN_JUMP_PER_SCAN:
+            anomaly_kind = "jump"
+
+    if anomaly_kind is not None:
+        pending_total = int((PENDING_TOKEN_RESULT or {}).get("total", -1) or -1)
+        if PENDING_TOKEN_KIND == anomaly_kind and total >= pending_total:
+            PENDING_TOKEN_COUNT += 1
+        else:
+            PENDING_TOKEN_COUNT = 1
+        PENDING_TOKEN_RESULT = safe
+        PENDING_TOKEN_KIND = anomaly_kind
+        if PENDING_TOKEN_COUNT < TOKEN_ANOMALY_CONFIRMATIONS or total <= 0 or not safe.get("sessions"):
+            log(
+                f"Token anomaly {anomaly_kind} ({previous_total} -> {total}); "
+                f"confirmation {PENDING_TOKEN_COUNT}/{TOKEN_ANOMALY_CONFIRMATIONS}"
+            )
+            return LAST_TOKEN_RESULT
+        log(f"Accepted confirmed Token correction ({previous_total} -> {total})")
+
+    PENDING_TOKEN_RESULT = None
+    PENDING_TOKEN_KIND = None
+    PENDING_TOKEN_COUNT = 0
+    LAST_TOKEN_DATE = today_key
+    return safe
 
 
 def maybe_collect_token_usage():
@@ -696,7 +809,12 @@ def maybe_collect_token_usage():
     if LAST_TOKEN_RESULT is not None and now - LAST_TOKEN_FETCH_AT < TOKEN_REFRESH_SECONDS:
         return LAST_TOKEN_RESULT
     try:
-        LAST_TOKEN_RESULT = collect_token_usage()
+        scan_started = time.monotonic()
+        result = collect_token_usage()
+        scan_seconds = time.monotonic() - scan_started
+        if scan_seconds > TOKEN_SCAN_WARN_SECONDS:
+            log(f"Token log scan is slow: {scan_seconds:.1f}s")
+        LAST_TOKEN_RESULT = stabilize_token_usage(result)
         LAST_TOKEN_FETCH_AT = now
     except Exception as exc:
         log(f"Token log scan failed: {exc}")
@@ -1152,16 +1270,29 @@ async def send_loop():
                     line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
                     encoded = line.encode("utf-8")
                     for start in range(0, len(encoded), BLE_CHUNK_SIZE):
-                        await client.write_gatt_char(RX_UUID, encoded[start : start + BLE_CHUNK_SIZE], response=True)
+                        await asyncio.wait_for(
+                            client.write_gatt_char(
+                                RX_UUID,
+                                encoded[start : start + BLE_CHUNK_SIZE],
+                                response=True,
+                            ),
+                            timeout=BLE_WRITE_TIMEOUT_SECONDS,
+                        )
                         await asyncio.sleep(0.03)
+                    write_heartbeat()
                     primary = payload.get("primary") or {}
                     secondary = payload.get("secondary") or {}
+                    tokens = payload.get("tokens") or {}
                     log(
                         f"Sent {payload.get('updated')} | "
-                        f"5h {primary.get('remaining')}% | 7d {secondary.get('remaining')}% | "
+                        f"{primary.get('label')} {primary.get('remaining')}% | "
+                        f"{secondary.get('label')} {secondary.get('remaining')}% | "
                         f"{payload.get('status')} | "
                         f"reset {primary.get('reset')}/{secondary.get('reset')} | "
-                        f"dur {primary.get('duration')}/{secondary.get('duration')}"
+                        f"dur {primary.get('duration')}/{secondary.get('duration')} | "
+                        f"tokens {tokens.get('total')} | usd {tokens.get('usd')} | "
+                        f"{tokens.get('pricing_label')} | priced calls "
+                        f"{tokens.get('calls', 0) - tokens.get('unpriced_calls', 0)}/{tokens.get('calls', 0)}"
                     )
                     remaining_delay = REFRESH_SECONDS - (time.monotonic() - cycle_started)
                     await asyncio.sleep(max(0, remaining_delay))
@@ -1174,6 +1305,7 @@ async def send_loop():
 
 def main():
     try:
+        write_heartbeat()
         asyncio.run(send_loop())
     except KeyboardInterrupt:
         log("Stopped.")
